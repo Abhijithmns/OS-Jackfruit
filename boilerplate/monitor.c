@@ -171,7 +171,7 @@ static void timer_callback(struct timer_list *t)
         }
 
         //hard-limit - kill nand remove
-        if((unsigned_long)rss >= entry->hard_limit_bytes) {
+        if((unsigned long)rss >= entry->hard_limit_bytes) {
             kill_process(entry->container_id, entry->pid, entry->hard_limit_bytes, rss);
             list_del(&entry->list);
             kfree(entry);
@@ -271,14 +271,14 @@ static long monitor_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     
     mutex_lock(&monitored_lock);
     list_for_each_entry_safe(entry, temp, &monitored_list, list) {  // macro : iterates through every node (its similar to for loop , defined in <linux/list.h>)
-        if(entry->pid == req.pid && strncmp(entry->container_id, req.container_id, sizeof(container_id)) == 0) {
+        if(entry->pid == req.pid && strncmp(entry->container_id, req.container_id, sizeof(entry->container_id)) == 0) {
             list_del(&entry->list); // removes node form the list, but does not free memory
             kfree(entry);
             found = 1;
             break;
         }
     }
-    mutex_unlock(&monitored_list);
+    mutex_unlock(&monitored_lock);
 
     if(!found) return -ENOENT;
 
@@ -331,7 +331,7 @@ static int __init monitor_init(void)
 /* --- Provided: Module Exit --- */
 static void __exit monitor_exit(void)
 {
-    del_timer_sync(&monitor_timer);
+    timer_delete_sync(&monitor_timer);
 
     /* ==============================================================
      * TODO 6: Free all remaining monitored entries.
