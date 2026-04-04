@@ -367,7 +367,45 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
  */
 void *logging_thread(void *arg)
 {
-    (void)arg;
+    supervisor_ctx_t *ctx = (supervisor_ctx_t *)arg;
+    log_item_t item;
+
+    while(1) {
+        // blocks until item is available or shutdown + empty
+        int rc = bounded_buffer_pop(&ctx->log_buffer, &item);
+        if(rc < 0) {
+            break; // shutdown , buffer drained -> exit
+        }
+
+        // find the log path for this container
+        char log_path[PATH_MAX];
+        pthread_mutex_lock(&ctx->metadata_lock);
+        container_record_t *c = ctx->containers;
+        //search the linked list for its ID
+        while(c != NULL) {
+            if(strncmp(c->id, item.container_id, CONTAINER_ID_LEN) == 0) { // compare both the IDs
+                strncpy(log_path, c->log_path, PATH_MAX - 1); // copy the path 
+                break;
+            }
+            c = c->next;
+        }
+        pthread_mutex_unlock(&ctx->metadata_lock);
+
+        if(c == NULL) {
+            // unknown container , discard
+            continue;
+        }
+
+        //append chunk to log file
+        int fd = open(log_path, O_WRONLY | O_CREAT | O_APPEND, 0644); // allows the owner to read and write a file, while others can only read it
+        if(fd < 0) {
+            perror("open log file");
+            continue;
+        }
+
+        write(fd, item.data, item.length);
+        close(fd);
+    }
     return NULL;
 }
 
