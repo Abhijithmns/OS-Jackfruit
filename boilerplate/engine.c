@@ -15,6 +15,7 @@
  *   - signal handling and graceful shutdown
  */
 
+#include <linux/limits.h>
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -289,9 +290,35 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
  */
 int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
+    pthread_mutex_lock(&buffer->mutex);
+
+    // wait while full
+    while(buffer->count == LOG_BUFFER_CAPACITY && !buffer->shutting_down) {
+        pthread_cond_wait(&buffer->not_full, &buffer->mutex);
+    }
+
+    //woke up due to shutdown so dont insert
+    if(buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+    // insert (circular)
+    
+    buffer->items[buffer->head] = *item;
+    buffer->head = (buffer->head + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count++;
+
+    // wake a consumer
+    // pthread_cond_signal() restarts one of the threads that are waiting on the condition variable cond.  
+    // If no threads are waiting on cond, nothing happens.   If  several  threads  are
+    // waiting on cond, exactly one is restarted, but it is not specified which.
+
+    pthread_cond_signal(&buffer->not_empty);
+    pthread_mutex_unlock(&buffer->mutex);
     return -1;
+     /* NOTE :  pthread_cond_wait()  atomically  unlocks the mutex (as per pthread_unlock_mutex()) and waits for the condition variable cond to be signaled.  The thread execution is suspended and
+     does not consume any CPU time until the condition variable is signaled.  The mutex must be locked by the calling thread on entrance to pthread_cond_wait().   Before  returning  to
+     the calling thread, pthread_cond_wait() re-acquires mutex (as per pthread_mutex_lock()). */
 }
 
 /*
@@ -305,8 +332,27 @@ int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
  */
 int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
+    pthread_mutex_lock(&buffer->mutex);
+
+    // wait if empty, but keep going if shutdown (drain remaining items)
+    while(buffer->count == 0 && !buffer->shutting_down) {
+        pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
+    }
+
+    // shutdown AND empty --> nothing left to drain tell caller to exit
+    if(buffer->count == 0 && buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    //remove form the end (circular)
+    *item = buffer->items[buffer->tail];
+    buffer->tail = (buffer->tail + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count--;
+
+    // wake a producer
+    pthread_cond_signal(&buffer->not_full);
+    pthread_mutex_unlock(&buffer->mutex);
     return -1;
 }
 
@@ -338,8 +384,55 @@ void *logging_thread(void *arg)
  */
 int child_fn(void *arg)
 {
-    (void)arg;
+    // redirecting stdout / stderr to the supervisor logging path
+    child_config_t *conf = (child_config_t *)arg;
+    
+    if( dup2(conf->log_write_fd , STDOUT_FILENO) < 0 || dup2(conf->log_write_fd , STDERR_FILENO) < 0 ) {
+        perror("dup2");
+        return 1;
+    }
+    close(conf->log_write_fd);
+
+    // mount /proc into rootfs so that commmands like ps work
+    // must be done before chroot after chroot you cant see the host path
+    // /proc is a virtual filesystem the kernel provides — it's not on disk. You have to explicitly mount it inside the container's rootfs 
+    // so commands like ps, top, cat /proc/meminfo work inside.
+    
+    char proc_path[PATH_MAX];
+    snprintf(proc_path , sizeof(proc_path) , "%s/proc", conf->rootfs);
+    mkdir(proc_path, 0555);
+    
+    if (mount("proc", proc_path , "proc", 0, NULL) < 0) {
+        perror("mount proc");
+        return 1;
+    }
+
+    // chroot = lock the container into its own filesystem so it can't touch the host.
+    // Without chdir("/") after, the working directory still points to the old host path even though root changed
+    if(chroot(conf->rootfs) < 0) {
+        perror("chroot");
+        return 1;
+    }
+    if(chdir("/") < 0) {
+        perror("chdir");
+        return 1;
+    }
+    // exec the command
+    
+    char *argv[] = {conf->command , NULL};
+    char *envp[] = {
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOME=/root",
+        "TERM=xterm",
+        NULL
+    };
+
+    execve(conf->command, argv, envp);
+
+    //execve only returns on failure
+    perror("execve");
     return 1;
+
 }
 
 int register_with_monitor(int monitor_fd,
