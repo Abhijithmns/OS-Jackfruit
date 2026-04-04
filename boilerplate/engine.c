@@ -143,6 +143,12 @@ typedef struct {
     container_record_t *containers;
 } supervisor_ctx_t;
 
+typedef struct {
+    int read_fd;
+    char container_id[CONTAINER_ID_LEN];
+    bounded_buffer_t *log_buffer;
+} pipe_reader_args_t;
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -423,6 +429,30 @@ void *logging_thread(void *arg)
     return NULL;
 }
 
+void *pipe_reader_thread(void *arg)
+{
+    pipe_reader_args_t *args = (pipe_reader_args_t *)arg;
+    log_item_t item;
+    ssize_t n;
+
+    while (1) {
+        memset(&item, 0, sizeof(item));
+        strncpy(item.container_id, args->container_id, CONTAINER_ID_LEN - 1);
+
+        n = read(args->read_fd, item.data, LOG_CHUNK_SIZE - 1);
+        if (n <= 0)
+            break;
+
+        item.length = (size_t)n;
+        if (bounded_buffer_push(args->log_buffer, &item) < 0)
+            break;
+    }
+
+    close(args->read_fd);
+    free(args);
+    return NULL;
+}
+
 /*
  * TODO:
  * Implement the clone child entrypoint.
@@ -611,8 +641,11 @@ static int run_supervisor(const char *rootfs)
         while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
             pthread_mutex_lock(&ctx.metadata_lock);
             container_record_t *c = ctx.containers;
+
             while (c != NULL) {
+
                 if (c->host_pid == pid) {
+
                     if (WIFEXITED(status)) {
                         c->state = CONTAINER_EXITED;
                         c->exit_code = WEXITSTATUS(status);
@@ -680,7 +713,7 @@ static int run_supervisor(const char *rootfs)
         cfg->nice_value = req.nice_value;
         cfg->log_write_fd = pipefd[1];
 
-        // allocate stack for clone
+        // allocate stack for clone (similar to fork)
         char *stack = malloc(STACK_SIZE);
         char *stack_top = stack + STACK_SIZE;
 
@@ -719,21 +752,28 @@ static int run_supervisor(const char *rootfs)
         pthread_mutex_unlock(&ctx.metadata_lock);
 
         // register with kernel monitor if available
-        if (ctx.monitor_fd >= 0)
-            register_with_monitor(ctx.monitor_fd, req.container_id, pid,
-                                  req.soft_limit_bytes, req.hard_limit_bytes);
+        if (ctx.monitor_fd >= 0) {
+            register_with_monitor(ctx.monitor_fd, req.container_id, pid,req.soft_limit_bytes, req.hard_limit_bytes);
+        }
 
-        // TODO: spawn a pipe reader thread to push container
-        //       output into the bounded log buffer
+        pipe_reader_args_t *reader_args = malloc(sizeof(pipe_reader_args_t));
+        reader_args->read_fd = pipefd[0];
+        reader_args->log_buffer = &ctx.log_buffer;
+        strncpy(reader_args->container_id, req.container_id, CONTAINER_ID_LEN - 1);
+
+        pthread_t reader_thread;
+        pthread_create(&reader_thread, NULL, pipe_reader_thread, reader_args);
+        pthread_detach(reader_thread);
+
 
         resp.status = 0;
-        snprintf(resp.message, sizeof(resp.message),
-                 "started %s pid=%d", req.container_id, pid);
+        snprintf(resp.message, sizeof(resp.message), "started %s pid=%d", req.container_id, pid);
 
         if (req.kind == CMD_RUN)
             waitpid(pid, NULL, 0);  // foreground — block until done
 
-    } else if (req.kind == CMD_PS) {
+    } 
+    else if (req.kind == CMD_PS) {
 
         pthread_mutex_lock(&ctx.metadata_lock);
         container_record_t *c = ctx.containers;
@@ -741,15 +781,14 @@ static int run_supervisor(const char *rootfs)
         off += snprintf(resp.message + off, sizeof(resp.message) - off,
                         "%-12s %-8s %-10s\n", "ID", "PID", "STATE");
         while (c != NULL && off < (int)sizeof(resp.message) - 1) {
-            off += snprintf(resp.message + off, sizeof(resp.message) - off,
-                            "%-12s %-8d %-10s\n",
-                            c->id, c->host_pid, state_to_string(c->state));
+            off += snprintf(resp.message + off, sizeof(resp.message) - off,"%-12s %-8d %-10s\n", c->id, c->host_pid, state_to_string(c->state));
             c = c->next;
         }
         pthread_mutex_unlock(&ctx.metadata_lock);
         resp.status = 0;
 
-    } else if (req.kind == CMD_STOP) {
+    } 
+    else if (req.kind == CMD_STOP) {
 
         pthread_mutex_lock(&ctx.metadata_lock);
         container_record_t *c = ctx.containers;
@@ -765,7 +804,8 @@ static int run_supervisor(const char *rootfs)
         resp.status = 0;
         snprintf(resp.message, sizeof(resp.message), "stopped %s", req.container_id);
 
-    } else if (req.kind == CMD_LOGS) {
+    } 
+    else if (req.kind == CMD_LOGS) {
 
         pthread_mutex_lock(&ctx.metadata_lock);
         container_record_t *c = ctx.containers;
@@ -793,7 +833,7 @@ static int run_supervisor(const char *rootfs)
     unlink(CONTROL_PATH);
     bounded_buffer_destroy(&ctx.log_buffer);
     pthread_mutex_destroy(&ctx.metadata_lock);
-    return 1;
+    return 0;
 }
 
 /*
@@ -916,12 +956,6 @@ static int cmd_ps(void)
      * The supervisor should respond with container metadata.
      * Keep the rendering format simple enough for demos and debugging.
      */
-    printf("Expected states include: %s, %s, %s, %s, %s\n",
-           state_to_string(CONTAINER_STARTING),
-           state_to_string(CONTAINER_RUNNING),
-           state_to_string(CONTAINER_STOPPED),
-           state_to_string(CONTAINER_KILLED),
-           state_to_string(CONTAINER_EXITED));
     return send_control_request(&req);
 }
 
