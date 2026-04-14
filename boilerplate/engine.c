@@ -466,55 +466,49 @@ void *pipe_reader_thread(void *arg)
  */
 int child_fn(void *arg)
 {
-    // redirecting stdout / stderr to the supervisor logging path
     child_config_t *conf = (child_config_t *)arg;
-    
-    if( dup2(conf->log_write_fd , STDOUT_FILENO) < 0 || dup2(conf->log_write_fd , STDERR_FILENO) < 0 ) {
+
+    // 1. chroot first
+    if (chroot(conf->rootfs) < 0) {
+        perror("chroot");
+        return 1;
+    }
+    if (chdir("/") < 0) {
+        perror("chdir");
+        return 1;
+    }
+
+    // 2. mount /proc inside container (after chroot, path is just /proc)
+    mkdir("/proc", 0555);
+    if (mount("proc", "/proc", "proc",
+              MS_NOEXEC | MS_NOSUID | MS_NODEV, NULL) < 0) {
+        perror("mount /proc (non-fatal)");
+        // non-fatal — continue even if already mounted
+    }
+
+    // 3. redirect stdout/stderr to log pipe
+    if (dup2(conf->log_write_fd, STDOUT_FILENO) < 0 ||
+        dup2(conf->log_write_fd, STDERR_FILENO) < 0) {
         perror("dup2");
         return 1;
     }
     close(conf->log_write_fd);
 
-    // mount /proc into rootfs so that commmands like ps work
-    // must be done before chroot after chroot you cant see the host path
-    // /proc is a virtual filesystem the kernel provides — it's not on disk. You have to explicitly mount it inside the container's rootfs 
-    // so commands like ps, top, cat /proc/meminfo work inside.
-    
-    char proc_path[PATH_MAX];
-    snprintf(proc_path , sizeof(proc_path) , "%s/proc", conf->rootfs);
-    mkdir(proc_path, 0555);
-    
-    if (mount("proc", proc_path , "proc", 0, NULL) < 0) {
-        perror("mount proc");
-        return 1;
-    }
+    // 4. apply nice value
+    if (conf->nice_value != 0)
+        nice(conf->nice_value);
 
-    // chroot = lock the container into its own filesystem so it can't touch the host.
-    // Without chdir("/") after, the working directory still points to the old host path even though root changed
-    if(chroot(conf->rootfs) < 0) {
-        perror("chroot");
-        return 1;
-    }
-    if(chdir("/") < 0) {
-        perror("chdir");
-        return 1;
-    }
-    // exec the command
-    
-    char *argv[] = {conf->command , NULL};
+    // 5. exec the command
+    char *argv[] = { conf->command, NULL };
     char *envp[] = {
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         "HOME=/root",
         "TERM=xterm",
         NULL
     };
-
     execve(conf->command, argv, envp);
-
-    //execve only returns on failure
     perror("execve");
     return 1;
-
 }
 
 int register_with_monitor(int monitor_fd,
