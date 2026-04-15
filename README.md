@@ -6,8 +6,8 @@ A lightweight Linux container runtime in C with a long-running supervisor and a 
 
 | Name | SRN |
 |------|-----|
-| M NAGA SAI ABHIJITH | PES2UG24CS252 |
-| MAHILAN | PES2UG24CS256 |
+| M NAGA SAI ABHIJITH | PES1UG24CS252 |
+| MAHILAN | PES1UG24CS256 |
 
 ## 2. Build, Load, and Run Instructions
 
